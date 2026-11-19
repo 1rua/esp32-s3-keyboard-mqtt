@@ -131,6 +131,9 @@ void HidExecutor::handleType(const String& text, uint16_t charDelayMs) {
       delay(8);  // 保持 8ms 确保主机 USB HID 端点可靠采信
       gKeyboard.release(static_cast<uint8_t>(c));
       delay(charDelayMs);
+    } else {
+      // 捕获并提示非 ASCII 字符（如中文 UTF-8 多字节序列）
+      Serial.printf("[HID] 提示: 物理键盘跳过非 ASCII 字符 (0x%02X)，建议使用粘贴模式 (paste)\n", static_cast<uint8_t>(c));
     }
   }
 }
@@ -178,19 +181,12 @@ void HidExecutor::executeJson(const String& jsonPayload) {
     String action(actionC);
     action.toLowerCase();
 
-    if (action == "type") {
+    if (action == "type" || action == "direct_text") {
       String text = cmd["text"] | "";
       uint16_t charDelay = cmd["delay"] | 20;
-      bool clearIme = cmd["clear_ime"] | false;
-      if (clearIme) {
-        gKeyboard.press(KEY_ESC);
-        delay(10);
-        gKeyboard.release(KEY_ESC);
-        delay(30);
-      }
       handleType(text, charDelay);
     } else if (action == "paste") {
-      // 粘贴模式：默认发送 Ctrl + V (可通过 modifier 定制)
+      // 粘贴快捷键：默认发送 Ctrl + V (可通过 modifier 定制)
       String modifier = cmd["modifier"] | "CTRL";
       modifier.toUpperCase();
       uint8_t modKey = (modifier == "GUI" || modifier == "CMD") ? KEY_LEFT_GUI : KEY_LEFT_CTRL;
@@ -200,11 +196,6 @@ void HidExecutor::executeJson(const String& jsonPayload) {
       delay(15);
       gKeyboard.releaseAll();
       delay(50);
-    } else if (action == "direct_text") {
-      // 直接输入文字模式：执行时序加固的文本输入
-      String text = cmd["text"] | "";
-      uint16_t charDelay = cmd["delay"] | 25;
-      handleType(text, charDelay);
     } else if (action == "key") {
       JsonArrayConst keys = cmd["keys"].as<JsonArrayConst>();
       if (!keys.isNull() && keys.size() > 0) {
