@@ -81,17 +81,55 @@ uint8_t HidExecutor::mapKeyToken(const String& rawToken) {
 
 void HidExecutor::handleType(const String& text, uint16_t charDelayMs) {
   if (charDelayMs > 500) charDelayMs = 500;
+  if (charDelayMs < 10) charDelayMs = 10;  // 保证基本按键间隔，防止丢键
 
-  for (size_t i = 0; i < text.length(); ++i) {
+  size_t len = text.length();
+  for (size_t i = 0; i < len; ++i) {
     char c = text[i];
-    if (c == '\n') {
-      gKeyboard.write(KEY_RETURN);
-    } else if (c == '\t') {
-      gKeyboard.write(KEY_TAB);
-    } else if (c >= 0x20 && c <= 0x7E) {
-      gKeyboard.write(static_cast<uint8_t>(c));
+
+    // 处理换行符：兼容 Windows CRLF (\r\n)、Unix LF (\n)、以及单个 CR (\r)
+    if (c == '\r') {
+      if (i + 1 < len && text[i + 1] == '\n') {
+        ++i;  // 跳过 CRLF 中的 \n，避免触发双次回车
+      }
+      gKeyboard.press(KEY_RETURN);
+      delay(12);
+      gKeyboard.release(KEY_RETURN);
+      delay(max<uint16_t>(charDelayMs, 30));
+      continue;
     }
-    if (charDelayMs > 0) {
+
+    if (c == '\n') {
+      gKeyboard.press(KEY_RETURN);
+      delay(12);
+      gKeyboard.release(KEY_RETURN);
+      delay(max<uint16_t>(charDelayMs, 30));
+      continue;
+    }
+
+    if (c == '\t') {
+      gKeyboard.press(KEY_TAB);
+      delay(10);
+      gKeyboard.release(KEY_TAB);
+      delay(charDelayMs);
+      continue;
+    }
+
+    // 针对空格键加强时序隔离，消除输入法连带候选词错乱
+    if (c == ' ') {
+      delay(5);
+      gKeyboard.press(' ');
+      delay(10);
+      gKeyboard.release(' ');
+      delay(charDelayMs);
+      continue;
+    }
+
+    // 标准可打印 ASCII 字符：严格保证按键按下保持时长与释放间隔
+    if (c >= 0x20 && c <= 0x7E) {
+      gKeyboard.press(static_cast<uint8_t>(c));
+      delay(8);  // 保持 8ms 确保主机 USB HID 端点可靠采信
+      gKeyboard.release(static_cast<uint8_t>(c));
       delay(charDelayMs);
     }
   }
@@ -143,6 +181,29 @@ void HidExecutor::executeJson(const String& jsonPayload) {
     if (action == "type") {
       String text = cmd["text"] | "";
       uint16_t charDelay = cmd["delay"] | 20;
+      bool clearIme = cmd["clear_ime"] | false;
+      if (clearIme) {
+        gKeyboard.press(KEY_ESC);
+        delay(10);
+        gKeyboard.release(KEY_ESC);
+        delay(30);
+      }
+      handleType(text, charDelay);
+    } else if (action == "paste") {
+      // 粘贴模式：默认发送 Ctrl + V (可通过 modifier 定制)
+      String modifier = cmd["modifier"] | "CTRL";
+      modifier.toUpperCase();
+      uint8_t modKey = (modifier == "GUI" || modifier == "CMD") ? KEY_LEFT_GUI : KEY_LEFT_CTRL;
+      gKeyboard.press(modKey);
+      delay(10);
+      gKeyboard.press('v');
+      delay(15);
+      gKeyboard.releaseAll();
+      delay(50);
+    } else if (action == "direct_text") {
+      // 直接输入文字模式：执行时序加固的文本输入
+      String text = cmd["text"] | "";
+      uint16_t charDelay = cmd["delay"] | 25;
       handleType(text, charDelay);
     } else if (action == "key") {
       JsonArrayConst keys = cmd["keys"].as<JsonArrayConst>();
