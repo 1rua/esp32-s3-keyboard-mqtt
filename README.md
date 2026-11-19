@@ -1,25 +1,95 @@
-# ESP32-S3 远程模拟键鼠 + 64KB 虚拟 U 盘中转系统
+# ESP32-S3 远程键鼠模拟与虚拟 U 盘中转系统
 
-一套**上下行完全解耦、零硬编码、支持 WebUI 强制门户动态配网**的硬件代理中转方案，包含 **ESP32-S3 固件（PlatformIO + Arduino + TinyUSB）** 与 **Agent 端通用 MQTT MCP Server（Python FastMCP + paho-mqtt）** 两大部分。
-
----
-
-## 核心特性
-
-- **上下行严格解耦**：上行（虚拟 U 盘回传文本）与下行（远程键鼠指令）使用独立 MQTT 主题，互不阻塞；即使受控主机界面锁死或处于全屏受限环境，下行 HID 盲操仍可独立执行。
-- **零硬编码动态配网（AP + Captive Portal + NVS）**：所有 Wi-Fi 与 MQTT 参数持久化保存在 ESP32 NVS（`Preferences`）中。首次开机无配置，或开机/运行期间长按板载 `BOOT (GPIO0)` 键超过 3 秒，自动开启 `ESP32-HID-Setup` 热点并通过 `DNSServer` + `WebServer` 弹出极简内联配置页（零外部 CDN 依赖），同时兼容**巴法云（无账密）**与**标准 EMQX / Mosquitto（账密认证）**。
-- **TinyUSB 三合一复合设备**：单根 USB 线缆同时枚举 `USBHIDKeyboard`、`USBHIDMouse` 与 `USBMSC`（大容量存储），无需外置 SD 卡。
-- **64KB FAT12 内存盘 + 1000ms 防抖 + 软重连刷新**：在内部 RAM 中构造标准 64KB FAT12 磁盘并预置 `in.txt`；主机写入后触发 1000ms 防抖，遍历 FAT12 簇链提取非空文本并发布至 `topic_up`，成功后立即重置内存盘并执行 `tud_disconnect()` → `delay(300)` → `tud_connect()` 强制主机刷新文件缓存。
-- **通用 Agent MCP 接入与守护监听**：Python 端全部通过环境变量读取配置，提供 `send_hid_commands` / `read_latest_uplink` MCP 工具以及独立守护脚本 `mqtt_watcher.py`（内置 Webhook 回调钩子）。
+通过 ESP32-S3 硬件将 AI Agent 与目标主机连接。下行通过 MQTT 接收控制指令，模拟标准 USB 键盘与鼠标；上行通过 64KB 虚拟 U 盘接收目标主机写入的文件，实现带外命令执行与双向数据闭环。
 
 ---
 
-## 系统架构
+## 硬件接口与接线说明（重要）
+
+标准 ESP32-S3 开发板通常配备两个 Type-C 接口，请务必注意区分：
+
+- **UART / COM 口**：仅用于连接开发电脑进行固件编译烧录，以及查看串口调试日志（115200 波特率）。
+- **USB-OTG 原生口**：**必须连接受控目标主机**。该接口由 ESP32-S3 片上原生 USB 控制器直接驱动，负责枚举为 HID 键盘、HID 鼠标以及卷标为 `ESP32_RELAY` 的虚拟 U 盘。若误插至 UART 口，受控主机将无法识别任何键鼠或存储设备。
+
+---
+
+## 快速开始
+
+### 方式一：一句话 Skill 自动化配置（推荐）
+
+本项目内置了完整的 Agent 自动化执行能力（位于 `skills/` 目录）。你无需手动执行编译、烧录和配置，只需让支持 Skill 的 Agent（如 DSH、Claude Desktop、Cursor 等）加载主技能并告知必要参数即可：
+
+> **一句话提示词示例**：  
+> “请使用当前项目的 `esp32-hid-relay` 技能帮我配置硬件并开始操控。我的 Wi-Fi 是 `Office_WiFi`，密码是 `12345678`，巴法云私钥是 `xxxxxxxx`，开发板已通过 UART 口连接电脑。”
+
+Agent 将依次自动完成以下步骤：
+1. **自动编译与烧录**：调用 `esp32-hid-flash` 编译固件并刷入连接的 ESP32-S3 开发板；
+2. **自动配网与初始化**：调用 `esp32-hid-init` 向设备写入 Wi-Fi 与 MQTT 参数并持久化至 NVS；
+3. **自动配置 MCP 环境**：调用 `esp32-hid-mcp-setup` 准备本地 Python 依赖、写入环境变量并完成连通性测试；
+4. **提示切换硬件接口**：提醒你将开发板的 **USB-OTG 原生口** 接入受控目标机；
+5. **直接进入操控模式**：Agent 调用 `send_hid_commands` 与 `read_latest_uplink` 开始控制目标主机。
+
+---
+
+### 方式二：手动配置
+
+若需手动编译烧录与部署，请按以下步骤操作：
+
+#### 1. 固件编译与烧录
+1. 使用 USB 数据线连接开发板的 **UART 口** 至本地电脑。
+2. 安装 PlatformIO 核心工具后，在项目根目录执行：
+   ```bash
+   # 标准 ESP32-S3-DevKitC-1 开发板
+   pio run -e esp32-s3-devkitc-1 -t upload
+   ```
+   *(注：若使用 16MB Flash 开发板可指定 `-e esp32-s3-n16r8`；单口板指定 `-e esp32-s3-single-usb`)*
+
+#### 2. 设备动态配网
+1. 烧录完成后，开发板首次通电（或长按板载 `BOOT (GPIO0)` 键超过 3 秒），将开启无密码 Wi-Fi 热点 `ESP32-HID-Setup`。
+2. 使用手机或电脑连接该热点，在弹出的页面（或浏览器访问 `http://192.168.4.1/`）填写：
+   - Wi-Fi 名称与密码；
+   - MQTT Broker 信息：巴法云填写 `bemfa.com:9501` 与控制台私钥；自建 Broker 填写对应 IP、端口及账密；
+   - 上行主题（如 `hidUp001`）与下行主题（如 `hidDown001`）。
+3. 点击「保存并重启」，ESP32 将自动连接目标 Wi-Fi 并接入 MQTT 服务。
+
+#### 3. 硬件接线切换
+将开发板与开发电脑断开，使用 USB 线将其 **USB-OTG 原生口** 插入需要被控制的目标电脑。目标电脑将自动识别出 HID 键鼠设备与一个 64KB 的磁盘。
+
+#### 4. Agent 端 MCP 服务接入
+1. 进入 `agent/` 目录准备 Python 环境并安装依赖：
+   ```bash
+   cd agent
+   python3 -m venv .venv
+   source .venv/bin/activate  # Windows: .venv\Scripts\activate
+   pip install -r requirements.txt
+   ```
+2. 复制配置模板并填入与设备一致的 MQTT 参数：
+   ```bash
+   cp .env.example .env
+   ```
+   *(注意：若使用标准 MQTT Broker，Agent 端的 Client ID 必须与 ESP32 设备的 Client ID 不同，例如附加 `_agent` 后缀，避免 Broker 互踢断线)*
+3. 在 MCP 宿主（如 Claude Desktop 的 `claude_desktop_config.json` 或 Cursor）中添加服务配置：
+   ```json
+   {
+     "mcpServers": {
+       "esp32-hid-relay": {
+         "command": "/绝对路径/agent/.venv/bin/python",
+         "args": ["/绝对路径/agent/mqtt_mcp_server.py"]
+       }
+     }
+   }
+   ```
+
+---
+
+## 开发文档
+
+### 系统架构
 
 ```text
 ┌────────────────────────────┐          ┌───────────────────────────────┐
 │     AI Agent / MCP 宿主    │          │       受控目标主机 (PC)       │
-│  (Claude Desktop / Cursor) │          │  (支持网络隔离 / 锁屏盲操)    │
+│  (Claude Desktop / Cursor) │          │  (无须联网 / 支持锁屏与隔离)  │
 └─────────────┬──────────────┘          └───────▲───────────────┬───────┘
               │ stdio MCP                       │ USB HID       │ 写入 E:\in.txt
 ┌─────────────▼──────────────┐                  │ (键鼠控制)    │ (64KB FAT12 MSC)
@@ -29,148 +99,114 @@
 │  agent/mqtt_watcher.py     │          │  - USBHIDKeyboard + Mouse     │
 └──────┬────────────▲────────┘          │  - 64KB FAT12 RAM Disk        │
        │            │                   │  - 1000ms 防抖 & USB 软重连   │
-       │ Publish    │ Subscribe         │  - NVS + AP Captive Portal    │
+       │ Publish    │ Subscribe         │  - NVS 持久化 + 动态配网      │
        │ topic_down │ topic_up          └───────▲───────────────┬───────┘
        ▼            │                           │ Subscribe     │ Publish
 ┌───────────────────┴───────────────────────────┴───────────────▼───────┐
-│           MQTT Broker（巴法云 bemfa.com:9501 / EMQX / Mosquitto）     │
+│           MQTT Broker (巴法云 bemfa.com:9501 / EMQX / Mosquitto)      │
 └───────────────────────────────────────────────────────────────────────┘
 ```
 
 ---
 
-## 🚀 极简免配置模式（AI Agent / Skill 一键使用）
+### 下行键鼠控制协议 (`topic_down`)
 
-本项目已内置完整的 **Agent Skill 自动化支持**（位于 `skills/` 目录）。**用户无需亲自手动配置任何代码或终端命令**，只需调起主技能 `esp32-hid-relay` 并告知 Agent 必要配置信息，Agent 即可全自动完成全流程并立即接管操控：
+MCP 工具 `send_hid_commands(commands)` 接收一个 JSON 数组或单条 JSON 对象，指令按序执行：
 
-```text
-用户：“我想使用这个项目，我的 Wi-Fi 是 Office_WiFi，密码 12345678，巴法云私钥是 xxxxx”
-  │
-  ├─► [子技能 1: esp32-hid-flash]   -> 自动检测串口、环境依赖、编译并烧录固件
-  ├─► [子技能 2: esp32-hid-init]    -> 自动向 ESP32 WebUI 提交网络与 MQTT 配置
-  ├─► [子技能 3: esp32-hid-mcp-setup] -> 自动配置本地 Python venv、生成 .env、注册 MCP 并自测连通性
-  │
-  └─► [Agent 操控模式]              -> Agent 直接通过 send_hid_commands / read_latest_uplink 操控目标主机！
-```
+- **输入纯文本 (`type`)**：
+  ```json
+  {"action": "type", "text": "echo hello", "delay": 20}
+  ```
+  逐字符模拟键盘敲击输入标准 ASCII 文本。`delay` 为字符间间隔（毫秒），建议设为 15~30ms 防止丢键。
+- **按键与组合快捷键 (`key`)**：
+  ```json
+  {"action": "key", "keys": ["GUI", "R"]}
+  {"action": "key", "keys": ["CTRL", "C"]}
+  {"action": "key", "keys": ["ENTER"]}
+  ```
+  支持的修饰键包括 `CTRL`, `ALT`, `SHIFT`, `GUI` (Win/Cmd 键)；支持常用控制键如 `ENTER`, `TAB`, `ESC`, `BACKSPACE`, `SPACE`, 方向键及 `F1`~`F12`。
+- **鼠标相对位移 (`mouse_move`)**：
+  ```json
+  {"action": "mouse_move", "x": 100, "y": -50}
+  ```
+  控制光标相对当前位置移动，固件自动将大数值分片为平滑运动。
+- **鼠标点击 (`mouse_click`)**：
+  ```json
+  {"action": "mouse_click", "button": "left", "double": false}
+  ```
+  `button` 可选 `left`, `right`, `middle`；`double` 为 `true` 时执行双击。
+- **动作延时 (`delay`)**：
+  ```json
+  {"action": "delay", "ms": 500}
+  ```
+  用于等待受控端系统窗口弹出或界面响应。
 
 ---
 
-## 项目目录结构
+### 上行传输机制 (`topic_up`)
+
+受控目标机写入文件后回传数据的完整机制：
+1. **虚拟磁盘构造**：ESP32 内部内存构建标准的 64KB FAT12 格式磁盘，预置单个空文件 `in.txt`。
+2. **写入与防抖**：目标主机向虚拟盘的 `in.txt` 写入内容。ESP32 检测到底层扇区写操作后启动 1000ms 防抖定时器，确保操作系统刷盘完成。
+3. **提取与上报**：防抖结束后遍历 FAT 簇链读取非空 UTF-8 文本，发布至 MQTT 的 `topic_up`。
+4. **软重连刷新**：上报成功后自动重置虚拟盘，并调用 USB 软重连（`tud_disconnect` → 延时 300ms → `tud_connect`），强制受控操作系统刷新磁盘缓存，为下次写入做好准备。
+5. **Agent 读取**：Agent 端调用 `read_latest_uplink(timeout=10)` 阻塞接收最新上报的文本。
+
+---
+
+### 双向带外闭环交互示例
+
+无需受控机连入网络，Agent 可通过盲打执行系统命令并将结果写入虚拟盘回传：
+
+#### Windows 示例：静默执行命令并读取回显
+```json
+// Agent 下发按键指令
+[
+  {"action": "key", "keys": ["GUI", "R"]},
+  {"action": "delay", "ms": 600},
+  {"action": "type", "text": "powershell -WindowStyle Hidden -Command \"$d = (Get-Volume -FileSystemLabel 'ESP32_RELAY').DriveLetter; whoami | Out-File -Encoding utf8 ($d + ':\\in.txt')\"", "delay": 20},
+  {"action": "delay", "ms": 200},
+  {"action": "key", "keys": ["ENTER"]}
+]
+```
+下发完成后调用 `read_latest_uplink(timeout=15)`，即可获取受控机的命令输出。
+
+---
+
+### 项目代码结构
 
 ```text
 esp32-s3-hid-msc-mqtt/
-├── platformio.ini                # ESP32-S3 TinyUSB 复合设备编译配置与依赖
-├── include/                      # 固件头文件 (NVS存储/Web配网/虚拟盘/HID执行器/MQTT桥接)
+├── platformio.ini                # 固件编译环境与依赖定义
+├── include/                      # 固件头文件
+│   ├── config_store.h            # NVS 配置读写
+│   ├── captive_portal.h          # 强制门户配网
+│   ├── ram_disk.h                # 64KB FAT12 内存盘与防抖解析
+│   ├── hid_executor.h            # HID 键鼠执行器
+│   └── mqtt_bridge.h             # MQTT 通信与断线重连
 ├── src/                          # 固件实现源码
-├── agent/
-│   ├── requirements.txt          # Python 依赖（fastmcp, paho-mqtt, python-dotenv）
-│   ├── .env.example              # Agent 端环境变量模板
-│   ├── mqtt_mcp_server.py        # 通用 MQTT MCP Server (stdio)
-│   └── mqtt_watcher.py           # 上行监听守护脚本 + Agent Webhook 回调模板
-├── skills/                       # 内置 Agent Skills 套件（用户免配置核心）
-│   ├── esp32-hid-relay/          # 主技能：总调度与 Agent 操控受控机实战指南
-│   ├── esp32-hid-flash/          # 子技能 1：固件自动编译与烧录工具
-│   ├── esp32-hid-init/           # 子技能 2：设备网络与 MQTT 初始化配网
-│   └── esp32-hid-mcp-setup/      # 子技能 3：Agent 端 Python 依赖与 MCP 服务配置
-└── README.md                     # 本说明文档
+├── agent/                        # Agent 端组件
+│   ├── requirements.txt          # Python 依赖
+│   ├── .env.example              # 环境变量模板
+│   ├── mqtt_mcp_server.py        # 通用 FastMCP 服务端
+│   └── mqtt_watcher.py           # 上行监听与 Webhook 回调守护
+└── skills/                       # 内置 Agent Skills 套件
+    ├── esp32-hid-relay/          # 主技能（总调度与实战指南）
+    ├── esp32-hid-flash/          # 子技能 1（固件自动编译与烧录）
+    ├── esp32-hid-init/           # 子技能 2（设备初始化与网络配置）
+    └── esp32-hid-mcp-setup/      # 子技能 3（Agent 运行环境与 MCP 配置）
 ```
 
 ---
 
-## 硬件准备与接线说明
+### 常见问题与排查
 
-- **推荐开发板**：带有原生 USB-OTG 接口的 **ESP32-S3** 开发板（如 `ESP32-S3-DevKitC-1`，通常配备 `UART/COM` 与 `USB/OTG` 两个 Type-C 接口）。
-- **双口用途区分**：
-  1. **UART / COM 口**：用于 PlatformIO 编译烧录及 115200 波特率串口日志监控（因 `-DARDUINO_USB_CDC_ON_BOOT=0`，日志默认走 UART0）。
-  2. **USB / OTG 原生口**：接入需要受控的目标主机，枚举为 HID 键盘 + HID 鼠标 + 卷标 `ESP32_RELAY` 的 64KB 虚拟 U 盘。
-- **板载 `BOOT` 按钮（GPIO0）**：开机时或运行期间长按超过 **3 秒** 进入强制门户配网模式。
-
----
-
-## 一、ESP32-S3 固件编译与烧录
-
-1. 安装 VS Code + PlatformIO IDE（或 CLI `pip install platformio`）。
-2. `firmware/platformio.ini` 自动拉取 `PubSubClient@^2.8` 与 `ArduinoJson@^7.2.0`；关键编译标志：
-   - `-DARDUINO_USB_MODE=0`：启用 TinyUSB 原生 USB-OTG。
-   - `-DARDUINO_USB_CDC_ON_BOOT=0`：保持 USB 描述符纯净，调试日志走 UART0。
-   - `-DMQTT_MAX_PACKET_SIZE=8192`：支持大段上行文本与批量 HID JSON 队列。
-3. 将开发板 **UART 口** 连接电脑后执行：
-   ```bash
-   cd firmware
-   pio run -t upload
-   pio device monitor -b 115200
-   ```
-4. 烧录完成后，将 **USB-OTG 原生口** 插入受控目标主机。
-
----
-
-## 二、WebUI 强制门户动态配网
-
-1. 首次通电（NVS 无有效配置）或长按 `BOOT (GPIO0)` > 3 秒后，设备开启开放热点 `ESP32-HID-Setup`。
-2. 手机或电脑连接热点后自动弹出配网页（或手动访问 `http://192.168.4.1/`）。
-3. 参数对照：
-   - **巴法云 (Bemfa)**：`mqtt_host = bemfa.com`，`mqtt_port = 9501`，`mqtt_client_id` 填私钥，`mqtt_user / mqtt_pass` **留空**。
-   - **标准 MQTT (EMQX / Mosquitto)**：填 Broker IP/域名与端口 `1883`，设备与 Agent 使用不同 `Client ID`，按需填账密。
-4. 配置不同的 `topic_up` 与 `topic_down`，点击「保存并重启」。
-
----
-
-## 三、下行键鼠控制协议（`topic_down`）
-
-支持单条 JSON 对象或 JSON 数组批量执行：
-- `{"action":"type","text":"hello","delay":20}`：逐字符输入 ASCII 文本，可配置间隔（ms）防丢字。
-- `{"action":"key","keys":["CTRL","C"]}`：单键或组合快捷键（支持 `CTRL/ALT/SHIFT/GUI/ENTER/TAB/ESC/F1-F12` 等）。
-- `{"action":"mouse_move","x":160,"y":-45}`：相对位移，超出 `[-127, 127]` 自动分片。
-- `{"action":"mouse_click","button":"left","double":false}`：支持 `left / right / middle` 及双击。
-- `{"action":"delay","ms":500}`：分片延时（上限 30000ms），不触发看门狗。
-
----
-
-## 四、上行 64KB FAT12 虚拟 U 盘机制（`topic_up`）
-
-- **扇区布局**：Sector 0 (BPB) + Sector 1–2 (双 FAT12) + Sector 3 (根目录含 `IN.TXT`) + Sector 4–127 (124 个数据簇，约 62KB 可用)。
-- **上传与刷新**：主机写入 `in.txt` → 1000ms 防抖 → 遍历簇链提取并去 BOM/空白 → 发布 `topic_up` → 清空重置内存盘 → `tud_disconnect()` + `delay(300)` + `tud_connect()` 强制主机刷新缓存。
-
----
-
-## 五、Agent 端 Python 组件启动与 MCP 接入
-
-```bash
-cd agent
-python -m venv .venv
-source .venv/bin/activate        # Windows: .venv\Scripts\activate
-pip install -r requirements.txt
-cp .env.example .env             # 填入与设备一致的 MQTT 参数
-python mqtt_watcher.py           # 启动上行监听守护（可配 AGENT_WEBHOOK_URL）
-```
-
-MCP 客户端（Claude Desktop / Cursor 等）配置示例：
-
-```json
-{
-  "mcpServers": {
-    "esp32-hid-relay": {
-      "command": "python",
-      "args": ["/abs/path/to/esp32-s3-hid-msc-mqtt/agent/mqtt_mcp_server.py"],
-      "env": {
-        "MQTT_HOST": "bemfa.com",
-        "MQTT_PORT": "9501",
-        "MQTT_CLIENT_ID": "YOUR_CLIENT_ID",
-        "MQTT_USER": "",
-        "MQTT_PASS": "",
-        "MQTT_TOPIC_UP": "hidUp004",
-        "MQTT_TOPIC_DOWN": "hidDown004"
-      }
-    }
-  }
-}
-```
-
----
-
-## 六、常见问题排查（FAQ）
-
-1. **未识别虚拟 U 盘/键鼠**：确认插在开发板的 **USB-OTG 原生口** 而非 UART 口，且线缆支持数据传输。
-2. **标准 Broker 频繁互踢掉线**：EMQX / Mosquitto 下请为 ESP32、`mqtt_mcp_server.py` 与 `mqtt_watcher.py` 分配不同的 `Client ID`。
-3. **超长文本上传**：若需单次超过 8KB，请同步调大 `MQTT_MAX_PACKET_SIZE` 与 `gMqtt.setBufferSize()`，并确认 Broker 单包限制。
-4. **安全建议**：勿将包含私钥或密码的 `.env` 提交至代码仓库，生产环境建议使用带 ACL 鉴权的私有 Broker。
+1. **目标主机无法识别键鼠或 U 盘**：
+   - 检查线缆是否插入了开发板的 **USB-OTG 原生口**。若插在 UART 口，目标机仅能识别为串口设备。
+   - 确认 USB 线支持数据传输，排除仅充电线缆。
+2. **MQTT 频繁掉线互踢**：
+   - 在标准 MQTT Broker（如 EMQX / Mosquitto）中，确保 ESP32 与 Agent 端的 `MQTT_CLIENT_ID` 不相同。
+3. **中文输入**：
+   - USB HID 模拟的是标准物理键盘按键扫描码，不能直接敲出中文字符。如需输入中文，建议通过剪贴板粘贴或命令重定向写入。
+4. **重新进入配网模式**：
+   - 通电运行期间，长按开发板上的 `BOOT (GPIO0)` 键超过 3 秒，设备将再次开启 `ESP32-HID-Setup` 配网热点。
