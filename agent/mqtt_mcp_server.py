@@ -177,20 +177,14 @@ def build_text_input_commands(
             return [{"action": "key", "keys": ["CTRL", "V"]}]
         # 采用 Base64 编码，避免双引号、单引号、换行符、反斜杠在受控端命令行解析错乱
         b64_str = base64.b64encode(text.encode("utf-8")).decode("ascii")
-        ps_cmd = (
-            f"powershell -WindowStyle Hidden -Command \""
-            f"$b=[Convert]::FromBase64String('{b64_str}');"
-            f"$t=[Text.Encoding]::UTF8.GetString($b);"
-            f"Add-Type -AssemblyName System.Windows.Forms;"
-            f"[Windows.Forms.Clipboard]::SetText($t)\""
-        )
+        ps_cmd = f"powershell -w h -c \"Set-Clipboard ([Text.Encoding]::UTF8.GetString([Convert]::FromBase64String('{b64_str}')))\""
         commands.extend([
             {"action": "key", "keys": ["GUI", "R"]},
             {"action": "delay", "ms": 400},
-            {"action": "type", "text": ps_cmd, "delay": 15},
+            {"action": "type", "text": ps_cmd, "delay": 12},
             {"action": "delay", "ms": 150},
             {"action": "key", "keys": ["ENTER"]},
-            {"action": "delay", "ms": 500},  # 等待命令执行并切回原焦点窗口
+            {"action": "delay", "ms": 600},  # 等待命令执行并切回原焦点窗口
             {"action": "key", "keys": ["CTRL", "V"]},
             {"action": "delay", "ms": 100},
         ])
@@ -203,8 +197,9 @@ def build_text_input_commands(
                 {"action": "delay", "ms": 40},
             ])
         norm_text = text.replace("\r\n", "\n").replace("\r", "\n")
-        safe_delay = max(15, min(int(delay), 300))
-        commands.append({"action": "direct_text", "text": norm_text, "delay": safe_delay})
+        safe_delay = max(20, min(int(delay), 300))
+        # 兼容当前在线固件与未来固件：下发时序加固的 type 动作
+        commands.append({"action": "type", "text": norm_text, "delay": safe_delay})
         return commands
 
     else:
