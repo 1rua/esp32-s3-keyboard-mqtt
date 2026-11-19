@@ -39,30 +39,39 @@
 
 ---
 
+## 🚀 极简免配置模式（AI Agent / Skill 一键使用）
+
+本项目已内置完整的 **Agent Skill 自动化支持**（位于 `skills/` 目录）。**用户无需亲自手动配置任何代码或终端命令**，只需调起主技能 `esp32-hid-relay` 并告知 Agent 必要配置信息，Agent 即可全自动完成全流程并立即接管操控：
+
+```text
+用户：“我想使用这个项目，我的 Wi-Fi 是 Office_WiFi，密码 12345678，巴法云私钥是 xxxxx”
+  │
+  ├─► [子技能 1: esp32-hid-flash]   -> 自动检测串口、环境依赖、编译并烧录固件
+  ├─► [子技能 2: esp32-hid-init]    -> 自动向 ESP32 WebUI 提交网络与 MQTT 配置
+  ├─► [子技能 3: esp32-hid-mcp-setup] -> 自动配置本地 Python venv、生成 .env、注册 MCP 并自测连通性
+  │
+  └─► [Agent 操控模式]              -> Agent 直接通过 send_hid_commands / read_latest_uplink 操控目标主机！
+```
+
+---
+
 ## 项目目录结构
 
 ```text
 esp32-s3-hid-msc-mqtt/
-├── firmware/
-│   ├── platformio.ini            # ESP32-S3 TinyUSB 复合设备编译配置与依赖
-│   ├── include/
-│   │   ├── config_store.h        # NVS Preferences 配置结构体与读写接口
-│   │   ├── captive_portal.h      # SoftAP + DNSServer + WebServer 强制门户声明
-│   │   ├── ram_disk.h            # 64KB FAT12 虚拟内存盘与 1000ms 防抖接口
-│   │   ├── hid_executor.h        # USB HID 键鼠 JSON 指令执行器声明
-│   │   └── mqtt_bridge.h         # Wi-Fi / MQTT 自动重连与下行队列声明
-│   └── src/
-│       ├── main.cpp              # 启动校验、GPIO0 (BOOT) 长按 3s 检测与主循环
-│       ├── config_store.cpp      # NVS 持久化读写与清空实现
-│       ├── captive_portal.cpp    # 零外部 CDN 内联 HTML/CSS 配网门户实现
-│       ├── ram_disk.cpp          # FAT12 构造/簇链解析 + tud_disconnect/connect 重连
-│       ├── hid_executor.cpp      # 单条/批量 JSON 指令、组合键映射与鼠标 int8 分片
-│       └── mqtt_bridge.cpp       # 巴法云无账密 / EMQX 账密自适应连接与断线重连
+├── platformio.ini                # ESP32-S3 TinyUSB 复合设备编译配置与依赖
+├── include/                      # 固件头文件 (NVS存储/Web配网/虚拟盘/HID执行器/MQTT桥接)
+├── src/                          # 固件实现源码
 ├── agent/
 │   ├── requirements.txt          # Python 依赖（fastmcp, paho-mqtt, python-dotenv）
 │   ├── .env.example              # Agent 端环境变量模板
-│   ├── mqtt_mcp_server.py        # 通用 MQTT MCP Server
+│   ├── mqtt_mcp_server.py        # 通用 MQTT MCP Server (stdio)
 │   └── mqtt_watcher.py           # 上行监听守护脚本 + Agent Webhook 回调模板
+├── skills/                       # 内置 Agent Skills 套件（用户免配置核心）
+│   ├── esp32-hid-relay/          # 主技能：总调度与 Agent 操控受控机实战指南
+│   ├── esp32-hid-flash/          # 子技能 1：固件自动编译与烧录工具
+│   ├── esp32-hid-init/           # 子技能 2：设备网络与 MQTT 初始化配网
+│   └── esp32-hid-mcp-setup/      # 子技能 3：Agent 端 Python 依赖与 MCP 服务配置
 └── README.md                     # 本说明文档
 ```
 

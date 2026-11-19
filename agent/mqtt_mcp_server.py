@@ -25,8 +25,10 @@ from dotenv import load_dotenv
 from fastmcp import FastMCP
 import paho.mqtt.client as mqtt
 
-# 自动加载当前目录的 .env（若存在），不覆盖系统已注入的环境变量
+# 自动加载当前目录与脚本所在目录的 .env（若存在），不覆盖系统已注入的环境变量
 load_dotenv()
+load_dotenv(os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env"))
+
 
 
 def _require_env(name: str) -> str:

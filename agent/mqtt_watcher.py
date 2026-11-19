@@ -19,6 +19,8 @@ from dotenv import load_dotenv
 import paho.mqtt.client as mqtt
 
 load_dotenv()
+load_dotenv(os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env"))
+
 
 
 def _require_env(name: str) -> str:
