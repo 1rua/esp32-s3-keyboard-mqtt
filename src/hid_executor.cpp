@@ -81,7 +81,7 @@ uint8_t HidExecutor::mapKeyToken(const String& rawToken) {
 
 void HidExecutor::handleType(const String& text, uint16_t charDelayMs) {
   if (charDelayMs > 500) charDelayMs = 500;
-  if (charDelayMs < 10) charDelayMs = 10;  // 保证基本按键间隔，防止丢键
+  if (charDelayMs < 20) charDelayMs = 20;  // 至少保证 20ms 间隔，防止 Windows 输入法队列丢键与 Shift 粘连
 
   size_t len = text.length();
   for (size_t i = 0; i < len; ++i) {
@@ -93,23 +93,23 @@ void HidExecutor::handleType(const String& text, uint16_t charDelayMs) {
         ++i;  // 跳过 CRLF 中的 \n，避免触发双次回车
       }
       gKeyboard.press(KEY_RETURN);
-      delay(12);
+      delay(15);
       gKeyboard.release(KEY_RETURN);
-      delay(max<uint16_t>(charDelayMs, 30));
+      delay(max<uint16_t>(charDelayMs, 50));  // 换行后等待 50ms，给主机编辑器留足重绘和缩进计算时间
       continue;
     }
 
     if (c == '\n') {
       gKeyboard.press(KEY_RETURN);
-      delay(12);
+      delay(15);
       gKeyboard.release(KEY_RETURN);
-      delay(max<uint16_t>(charDelayMs, 30));
+      delay(max<uint16_t>(charDelayMs, 50));
       continue;
     }
 
     if (c == '\t') {
       gKeyboard.press(KEY_TAB);
-      delay(10);
+      delay(12);
       gKeyboard.release(KEY_TAB);
       delay(charDelayMs);
       continue;
@@ -117,18 +117,18 @@ void HidExecutor::handleType(const String& text, uint16_t charDelayMs) {
 
     // 针对空格键加强时序隔离，消除输入法连带候选词错乱
     if (c == ' ') {
-      delay(5);
-      gKeyboard.press(' ');
       delay(10);
+      gKeyboard.press(' ');
+      delay(12);
       gKeyboard.release(' ');
-      delay(charDelayMs);
+      delay(max<uint16_t>(charDelayMs, 25));
       continue;
     }
 
-    // 标准可打印 ASCII 字符：严格保证按键按下保持时长与释放间隔
+    // 标准可打印 ASCII 字符：严格保证按键按下保持时长（10ms）与释放间隔
     if (c >= 0x20 && c <= 0x7E) {
       gKeyboard.press(static_cast<uint8_t>(c));
-      delay(8);  // 保持 8ms 确保主机 USB HID 端点可靠采信
+      delay(10);  // 保持 10ms 确保主机 USB HID 抓取到按键与 Shift 修饰键同步有效
       gKeyboard.release(static_cast<uint8_t>(c));
       delay(charDelayMs);
     } else {

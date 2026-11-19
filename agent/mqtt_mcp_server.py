@@ -221,10 +221,10 @@ def build_text_input_commands(
         if clear_ime:
             commands.extend([
                 {"action": "key", "keys": ["ESC"]},
-                {"action": "delay", "ms": 40},
+                {"action": "delay", "ms": 50},
             ])
         norm_text = text.replace("\r\n", "\n").replace("\r", "\n")
-        safe_delay = max(15, min(int(delay), 300))
+        safe_delay = max(25, min(int(delay), 300))  # 默认 25~35ms 保证 USB 报告与输入法队列消化
         commands.append({"action": "type", "text": norm_text, "delay": safe_delay})
         return commands, "typing"
 
