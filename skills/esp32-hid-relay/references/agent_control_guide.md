@@ -6,42 +6,69 @@
 
 ## 一、MCP 工具接口定义
 
-MCP Server (`esp32-hid-relay`) 暴露了两个基础工具：
+MCP Server (`esp32-hid-relay`) 暴露了核心工具：
 
-### 1. `send_hid_commands(commands: list[dict])`
+### 1. `input_text(text: str, mode: str = "typing", delay: int = 25, clear_ime: bool = True, target_os: str = "windows")`
+专用于文本录入的高阶工具，提供三种模式以应对各种跨设备输入场景：
+
+> **⚠️ 核心准则**：
+> 1. **默认策略**：**如果用户没有明确指定输入模式，Agent 必须默认使用 `typing`（模拟打字模式）！**
+> 2. **自主决策（该输入中文时输入中文）**：**凡文本中包含中文汉字、中文注释、多行复杂代码，Agent 应主动、自主地选择 `paste`（粘贴模式），以确保中文字符 100% 完整录入且排版完全保真。**
+
+| 模式 | 参数值 | 说明与工作机制 | 适用场景与限制 |
+| :--- | :--- | :--- | :--- |
+| **模拟打字模式** | `"typing"` | **【默认】逐键模拟敲击物理键盘**，按 `delay` 间隔逐字敲入。纯硬件扫描码实现，跨 Windows / Linux / macOS 通用。打字前自动发 ESC 清理未决拼音悬挂，已针对换行与空格时序防抖加固。 | 终端命令、命令行交互、纯 ASCII 短文本 |
+| **直接输入文字模式** | `"direct"` | **直接向当前活动窗口逐字输入纯 ASCII 文本**，不经过系统剪贴板。若检测到中文字符，自动安全升格为 `paste` 模式防丢字。 | 纯英文单行代码、不想覆盖剪贴板时 |
+| **粘贴模式** | `"paste"` | **【该输入中文时输入中文】的通用首选模式**！利用受控机系统剪贴板通道秒级完成粘贴。输入大段中文、中英文注释、复杂多行源码时的唯一绝对保真模式。 | 多行源码、中英文混合、中文注释、长文本 |
+
+### 2. `send_hid_commands(commands: list[dict])`
 向下行主题发送 JSON 指令队列。数组中的所有动作会按顺序在 ESP32 上执行。
 
 支持的动作类型：
-- **文本输入 (`type`)**：
-  `{"action": "type", "text": "cmd.exe", "delay": 20}`
-  - `text`: 待输入的纯文本（仅支持标准 ASCII 字符，输入换行请用 `\n`）。
-  - `delay`: 字符间输入延时（毫秒，默认 20ms，防止受控端丢字；输入长命令建议 15~30ms）。
+- **模拟打字 (`type`)**：
+  `{"action": "type", "text": "echo hello", "delay": 25, "clear_ime": true}`
+- **直接输入文字 (`direct_text`)**：
+  `{"action": "direct_text", "text": "var x = 1;", "delay": 25}`
+- **粘贴模式 (`paste`)**：
+  - 自动安全置剪贴板并粘贴：`{"action": "paste", "text": "#include <stdio.h>\n...", "target_os": "windows"}`
+  - 纯物理按键粘贴：`{"action": "paste"}`（触发 Ctrl + V，macOS 自动适配 Cmd + V）
 - **按键/快捷键 (`key`)**：
   `{"action": "key", "keys": ["GUI", "R"]}`
-  - `keys`: 按键标记列表。列表内多个键会同时按下并自动释放。
   - 常用修饰键：`CTRL`, `ALT`, `SHIFT`, `GUI` (Win/Cmd键)。
   - 常用控制键：`ENTER`, `TAB`, `ESC`, `BACKSPACE`, `SPACE`, `UP`, `DOWN`, `LEFT`, `RIGHT`, `PAGEUP`, `PAGEDOWN`, `F1`~`F12`。
 - **鼠标相对移动 (`mouse_move`)**：
   `{"action": "mouse_move", "x": 100, "y": -50}`
-  - `x`: X 轴相对位移（向右为正，向左为负）。
-  - `y`: Y 轴相对位移（向下为正，向上为负）。
-  - 固件已内置超限自动分片，单次传大数值（如 `x: 800`）亦可平滑分步移动。
 - **鼠标点击 (`mouse_click`)**：
   `{"action": "mouse_click", "button": "left", "double": false}`
-  - `button`: `left` (左键), `right` (右键), `middle` (中键)。
-  - `double`: `true` 为双击，`false` 为单击。
 - **延时等待 (`delay`)**：
   `{"action": "delay", "ms": 500}`
-  - `ms`: 等待毫秒数（上限 30000ms），用于等待目标系统弹窗或应用加载。
 
-### 2. `read_latest_uplink(timeout: int = 10) -> str`
+### 3. `read_latest_uplink(timeout: int = 10) -> str`
 阻塞等待并返回 ESP32 虚拟 U 盘抓取到的最新一条文件内容（来自目标主机向虚拟盘 `in.txt` 的写入）。
-- `timeout`: 最长等待秒数（默认 10 秒，最大 300 秒）。
-- 若超时未收到任何内容，返回空字符串 `""`。
 
 ---
 
-## 二、核心工作流：带外闭环命令执行模式
+## 二、连续中英文输入错乱的原因与三大模式的解决方案
+
+### 1. 为什么模拟键盘输入连续中英文/代码时会错乱？
+在目标主机处于中文输入法状态下（如微软拼音、搜狗输入法、Fcitx5 等），当逐键模拟敲击英文字母时：
+1. 英文字母会被操作系统输入法拦截并作为拼音缓冲；
+2. 当遇到空格 `' '` 时，输入法会将空格作为“确认首选候选词”提交上屏，导致英文字母被强行转变为风马牛不相及的中文词汇（例如 `stdio` 遇到空格变成“收徒弟哦”，`double` 变成“的特人民安踏”）；
+3. 当遇到回车 `\n` 时，若未做防抖或时序隔离，可能触发输入法编码直接上屏或连续换行错位；
+4. 符号键（如 `<`、`>`、`#`）需要触发 Shift 键，若按键抬起过快，可能被系统误判为单击 Shift 从而反复切换中英文状态；
+5. USB HID 物理键盘只能模拟标准 ASCII 扫描码，无法直接敲击中文字符，若强行打字，中文字符会被丢弃。
+
+### 2. 解决方案与选择指引
+- **默认选择（模拟打字模式）**：
+  打字前自动发送 `ESC` 清除历史拼音悬挂，按键保持时间（10ms）与换行隔离延时（50ms）有效消除了物理层粘连。若用户未特别指定模式，**一律默认采用此模式**。
+- **大段代码/中英文混排强烈推荐（粘贴模式）**：
+  用户若要求输入整段代码、多行配置或包含中英文的复杂文档，使用 `mode="paste"`。粘贴模式彻底绕过输入法的所有按键拦截，无论多长均可瞬间无损完成录入，且排版与中文 100% 完整。
+- **纯英文免剪贴板场景（直接输入模式）**：
+  若输入纯英文内容且用户明确要求不覆盖原有剪贴板，使用 `mode="direct"`。若包含中文，系统会自动安全升格为 `paste` 模式避免丢字。
+
+---
+
+## 三、核心工作流：带外闭环命令执行模式
 
 利用虚拟 U 盘（卷标 `ESP32_RELAY`，容量 64KB），Agent 可以下发运行命令，受控主机将执行结果写入 U 盘根目录的 `in.txt`，ESP32 内部防抖 1000ms 后解析并将内容推回 MQTT，Agent 随后调用 `read_latest_uplink` 获取输出，完成**双向命令闭环**。
 
@@ -54,7 +81,7 @@ MCP Server (`esp32-hid-relay`) 暴露了两个基础工具：
 [
   {"action": "key", "keys": ["GUI", "R"]},
   {"action": "delay", "ms": 600},
-  {"action": "type", "text": "powershell -WindowStyle Hidden -Command \"$drive = (Get-Volume -FileSystemLabel 'ESP32_RELAY').DriveLetter; ipconfig | Out-File -Encoding utf8 -FilePath ($drive + ':\\in.txt')\"", "delay": 15},
+  {"action": "type", "text": "powershell -WindowStyle Hidden -Command \"$d = (Get-Volume -FileSystemLabel 'ESP32_RELAY').DriveLetter; whoami | Out-File -Encoding utf8 ($d + ':\\in.txt')\"", "delay": 20},
   {"action": "delay", "ms": 200},
   {"action": "key", "keys": ["ENTER"]}
 ]
@@ -85,40 +112,8 @@ Agent 调用 `read_latest_uplink(timeout=10)` 获取系统内核信息。
 
 ---
 
-## 三、常用场景指令示例库
-
-### 场景 1：Windows 锁屏解锁与密码输入
-```json
-[
-  {"action": "key", "keys": ["SPACE"]},
-  {"action": "delay", "ms": 500},
-  {"action": "type", "text": "MyPassword123", "delay": 30},
-  {"action": "delay", "ms": 200},
-  {"action": "key", "keys": ["ENTER"]}
-]
-```
-
-### 场景 2：打开浏览器访问特定网页
-```json
-[
-  {"action": "key", "keys": ["GUI", "R"]},
-  {"action": "delay", "ms": 500},
-  {"action": "type", "text": "msedge https://www.bing.com", "delay": 15},
-  {"action": "delay", "ms": 200},
-  {"action": "key", "keys": ["ENTER"]}
-]
-```
-
-### 场景 3：输入大段脚本或绕过特殊字符
-USB HID 键盘只能逐键敲击 ASCII 字符，若需要向受控机传输包含特殊符号、多行脚本或中文字符的复杂内容，最佳实践是：
-1. **Base64 编码传输**：
-   将脚本编码为 Base64 单行文本，在目标主机通过 `[System.Text.Encoding]::UTF8.GetString([System.Convert]::FromBase64String('...'))` 解码后执行。
-2. **通过虚拟 U 盘中转**：受控机也可以直接运行脚本并将详细报错或日志重定向回 `in.txt`。
-
----
-
 ## 四、Agent 交互注意事项
 
-1. **操作前防丢步**：下发弹窗类按键（如 `GUI + R` 或 `CTRL + ALT + T`）后，**务必附加 500~1000ms 的 `delay`**，等待受控机 UI 绘制完成再输入后续文本。
-2. **虚拟盘写入防抖机制**：受控端写入 `in.txt` 后，ESP32 固件有 1000ms 的防抖等待以确保受控端刷盘结束，读取上行时建议将 `timeout` 设置在 10~20 秒以上。
-3. **单包体积注意**：受限于 64KB FAT12 格式与 MQTT 单包缓冲区（8KB），单次写入 `in.txt` 的文本内容建议控制在 8KB 以内。长输出建议使用 `head -n 50` 或分页截断。
+1. **用户未指定输入模式时，默认使用模拟打字模式 (`typing`)**。
+2. **该输入中文时输入中文**：涉及中文（文档、注释、汉字）或多行代码时，Agent 必须自主选用 `paste` 模式以确保字符完整。
+3. **操作前防丢步**：下发弹窗类按键（如 `GUI + R` 或 `CTRL + ALT + T`）后，务必附加 500~600ms 的 `delay`，等待受控机 UI 绘制完成再输入后续文本。

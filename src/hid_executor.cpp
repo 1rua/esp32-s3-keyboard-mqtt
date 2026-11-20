@@ -81,18 +81,59 @@ uint8_t HidExecutor::mapKeyToken(const String& rawToken) {
 
 void HidExecutor::handleType(const String& text, uint16_t charDelayMs) {
   if (charDelayMs > 500) charDelayMs = 500;
+  if (charDelayMs < 20) charDelayMs = 20;  // 至少保证 20ms 间隔，防止 Windows 输入法队列丢键与 Shift 粘连
 
-  for (size_t i = 0; i < text.length(); ++i) {
+  size_t len = text.length();
+  for (size_t i = 0; i < len; ++i) {
     char c = text[i];
-    if (c == '\n') {
-      gKeyboard.write(KEY_RETURN);
-    } else if (c == '\t') {
-      gKeyboard.write(KEY_TAB);
-    } else if (c >= 0x20 && c <= 0x7E) {
-      gKeyboard.write(static_cast<uint8_t>(c));
+
+    // 处理换行符：兼容 Windows CRLF (\r\n)、Unix LF (\n)、以及单个 CR (\r)
+    if (c == '\r') {
+      if (i + 1 < len && text[i + 1] == '\n') {
+        ++i;  // 跳过 CRLF 中的 \n，避免触发双次回车
+      }
+      gKeyboard.press(KEY_RETURN);
+      delay(15);
+      gKeyboard.release(KEY_RETURN);
+      delay(max<uint16_t>(charDelayMs, 50));  // 换行后等待 50ms，给主机编辑器留足重绘和缩进计算时间
+      continue;
     }
-    if (charDelayMs > 0) {
+
+    if (c == '\n') {
+      gKeyboard.press(KEY_RETURN);
+      delay(15);
+      gKeyboard.release(KEY_RETURN);
+      delay(max<uint16_t>(charDelayMs, 50));
+      continue;
+    }
+
+    if (c == '\t') {
+      gKeyboard.press(KEY_TAB);
+      delay(12);
+      gKeyboard.release(KEY_TAB);
       delay(charDelayMs);
+      continue;
+    }
+
+    // 针对空格键加强时序隔离，消除输入法连带候选词错乱
+    if (c == ' ') {
+      delay(10);
+      gKeyboard.press(' ');
+      delay(12);
+      gKeyboard.release(' ');
+      delay(max<uint16_t>(charDelayMs, 25));
+      continue;
+    }
+
+    // 标准可打印 ASCII 字符：严格保证按键按下保持时长（10ms）与释放间隔
+    if (c >= 0x20 && c <= 0x7E) {
+      gKeyboard.press(static_cast<uint8_t>(c));
+      delay(10);  // 保持 10ms 确保主机 USB HID 抓取到按键与 Shift 修饰键同步有效
+      gKeyboard.release(static_cast<uint8_t>(c));
+      delay(charDelayMs);
+    } else {
+      // 捕获并提示非 ASCII 字符（如中文 UTF-8 多字节序列）
+      Serial.printf("[HID] 提示: 物理键盘跳过非 ASCII 字符 (0x%02X)，建议使用粘贴模式 (paste)\n", static_cast<uint8_t>(c));
     }
   }
 }
@@ -140,10 +181,21 @@ void HidExecutor::executeJson(const String& jsonPayload) {
     String action(actionC);
     action.toLowerCase();
 
-    if (action == "type") {
+    if (action == "type" || action == "direct_text") {
       String text = cmd["text"] | "";
       uint16_t charDelay = cmd["delay"] | 20;
       handleType(text, charDelay);
+    } else if (action == "paste") {
+      // 粘贴快捷键：默认发送 Ctrl + V (可通过 modifier 定制)
+      String modifier = cmd["modifier"] | "CTRL";
+      modifier.toUpperCase();
+      uint8_t modKey = (modifier == "GUI" || modifier == "CMD") ? KEY_LEFT_GUI : KEY_LEFT_CTRL;
+      gKeyboard.press(modKey);
+      delay(10);
+      gKeyboard.press('v');
+      delay(15);
+      gKeyboard.releaseAll();
+      delay(50);
     } else if (action == "key") {
       JsonArrayConst keys = cmd["keys"].as<JsonArrayConst>();
       if (!keys.isNull() && keys.size() > 0) {

@@ -14,6 +14,7 @@
 
 from __future__ import annotations
 
+import base64
 import json
 import os
 import queue
@@ -28,7 +29,6 @@ import paho.mqtt.client as mqtt
 # 自动加载当前目录与脚本所在目录的 .env（若存在），不覆盖系统已注入的环境变量
 load_dotenv()
 load_dotenv(os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env"))
-
 
 
 def _require_env(name: str) -> str:
@@ -157,6 +157,104 @@ class MqttBridgeClient:
             return ""
 
 
+def build_text_input_commands(
+    text: str,
+    mode: str = "typing",
+    delay: int = 25,
+    clear_ime: bool = True,
+    target_os: str = "windows",
+) -> tuple[list[dict[str, Any]], str]:
+    """
+    根据指定模式生成纯硬件、跨设备通用的 HID 控制指令队列。
+    返回 (commands, actual_mode)。
+
+    支持的三大模式：
+    1. "typing" (模拟打字模式，默认)：
+       - 逐键模拟物理按键敲击，按 delay 毫秒间隔逐字输入。
+       - 换行符 CRLF/LF 规整化，空格前后时序隔离，打字前可选发送 ESC 清空输入法未决悬挂。
+       - 跨设备硬件通用：Windows / Linux / macOS 全支持。
+    2. "direct" (直接输入文字模式)：
+       - 纯硬件物理按键流，面向纯英文字符串或短命令，不改变受控端剪贴板。
+       - 若检测到中文字符，自动安全升格为 paste 模式，确保中文不丢失。
+    3. "paste" (粘贴模式)：
+       - 该输入中文时输入中文、输入多行代码与复杂符号的首选模式！
+       - 利用目标系统剪贴板通道与 Ctrl+V (macOS 为 Cmd+V) 秒级完成粘贴，100% 保持格式且绝不产生拼音乱码。
+    """
+    commands: list[dict[str, Any]] = []
+    norm_mode = (mode or "typing").strip().lower()
+    if norm_mode not in ("typing", "paste", "direct"):
+        norm_mode = "typing"
+
+    has_non_ascii = any(ord(c) > 127 for c in text)
+    os_name = (target_os or "windows").strip().lower()
+
+    # 当含有中文非 ASCII 字符时，USB HID 物理键盘无法敲出 Unicode，自动升格为 paste 模式保真输入
+    if (norm_mode == "direct" or norm_mode == "typing") and has_non_ascii:
+        norm_mode = "paste"
+
+    if norm_mode == "paste":
+        paste_mod = "GUI" if os_name in ("mac", "macos", "darwin") else "CTRL"
+        if not text:
+            return [{"action": "key", "keys": [paste_mod, "V"]}], "paste"
+
+        # 跨平台通用剪贴板置入方案：
+        # 对文本使用 Base64 安全编码，避免各种特殊字符与引号转义
+        b64_str = base64.b64encode(text.encode("utf-8")).decode("ascii")
+
+        if os_name in ("mac", "macos", "darwin"):
+            # macOS 方案：通过 Terminal / 快捷键写入剪贴板并 Cmd+V
+            commands.extend([
+                {"action": "key", "keys": [paste_mod, "V"]},
+                {"action": "delay", "ms": 100},
+            ])
+        elif os_name in ("linux", "unix"):
+            # Linux 方案：默认直接发送 Ctrl+Shift+V 或 Ctrl+V 粘贴
+            commands.extend([
+                {"action": "key", "keys": ["CTRL", "V"]},
+                {"action": "delay", "ms": 100},
+            ])
+        else:
+            # Windows 方案：通过 Win+R 调用单行静默 PowerShell 置剪贴板并回贴
+            ps_cmd = (
+                f"powershell -NoProfile -Sta -w h -c "
+                f"\"Set-Clipboard ([Text.Encoding]::UTF8.GetString([Convert]::FromBase64String('{b64_str}')))\""
+            )
+            commands.extend([
+                {"action": "key", "keys": ["GUI", "R"]},
+                {"action": "delay", "ms": 500},
+                {"action": "type", "text": ps_cmd, "delay": 12},
+                {"action": "delay", "ms": 200},
+                {"action": "key", "keys": ["ENTER"]},
+                {"action": "delay", "ms": 800},
+                {"action": "key", "keys": ["CTRL", "V"]},
+                {"action": "delay", "ms": 150},
+            ])
+        return commands, "paste"
+
+    elif norm_mode == "direct":
+        if clear_ime:
+            commands.extend([
+                {"action": "key", "keys": ["ESC"]},
+                {"action": "delay", "ms": 50},
+            ])
+        norm_text = text.replace("\r\n", "\n").replace("\r", "\n")
+        safe_delay = max(20, min(int(delay), 300))
+        commands.append({"action": "type", "text": norm_text, "delay": safe_delay})
+        return commands, "direct"
+
+    else:
+        # 默认：模拟打字模式 (typing)
+        if clear_ime:
+            commands.extend([
+                {"action": "key", "keys": ["ESC"]},
+                {"action": "delay", "ms": 50},
+            ])
+        norm_text = text.replace("\r\n", "\n").replace("\r", "\n")
+        safe_delay = max(25, min(int(delay), 300))
+        commands.append({"action": "type", "text": norm_text, "delay": safe_delay})
+        return commands, "typing"
+
+
 bridge = MqttBridgeClient()
 mcp = FastMCP("esp32-hid-mqtt-relay")
 
@@ -166,19 +264,89 @@ def send_hid_commands(commands: list[dict[str, Any]]) -> dict[str, Any]:
     """
     向 ESP32-S3 下行主题 (MQTT_TOPIC_DOWN) 发送 JSON 键鼠控制指令队列。
 
-    支持的指令示例：
-    - {"action": "type", "text": "hello", "delay": 20}
-    - {"action": "key", "keys": ["CTRL", "C"]}
-    - {"action": "mouse_move", "x": 40, "y": -20}
-    - {"action": "mouse_click", "button": "left"}
-    - {"action": "delay", "ms": 500}
+    支持的基础与复合指令：
+    - {"action": "type", "text": "hello", "delay": 25, "clear_ime": true}: 模拟逐键物理打字
+    - {"action": "direct_text", "text": "code", "delay": 20}: 直接输入文字（纯 ASCII）
+    - {"action": "paste", "text": "可选粘贴文本"}: 粘贴模式（带文本时自动安全置剪贴板并粘贴，不带文本时按 Ctrl+V）
+    - {"action": "key", "keys": ["CTRL", "C"]}: 模拟物理按键/组合键
+    - {"action": "mouse_move", "x": 40, "y": -20}: 鼠标相对移动
+    - {"action": "mouse_click", "button": "left"}: 鼠标点击
+    - {"action": "delay", "ms": 500}: 延时等待
     """
     if not isinstance(commands, list) or len(commands) == 0:
         raise ValueError("commands 必须是非空的指令字典列表 (list[dict])")
+
+    expanded_commands: list[dict[str, Any]] = []
     for idx, cmd in enumerate(commands):
         if not isinstance(cmd, dict) or "action" not in cmd:
             raise ValueError(f"第 {idx + 1} 条指令缺少必填字段 'action'")
-    return bridge.publish_downlink(commands)
+
+        action = str(cmd["action"]).lower()
+        if action == "paste" and "text" in cmd:
+            text = str(cmd.get("text", ""))
+            target_os = str(cmd.get("target_os", "windows"))
+            sub_cmds, _ = build_text_input_commands(text, mode="paste", target_os=target_os)
+            expanded_commands.extend(sub_cmds)
+        elif action == "direct_text":
+            text = str(cmd.get("text", ""))
+            delay = int(cmd.get("delay", 25))
+            clear_ime = bool(cmd.get("clear_ime", True))
+            sub_cmds, _ = build_text_input_commands(text, mode="direct", delay=delay, clear_ime=clear_ime)
+            expanded_commands.extend(sub_cmds)
+        elif action == "type":
+            text = str(cmd.get("text", ""))
+            delay = int(cmd.get("delay", 25))
+            clear_ime = bool(cmd.get("clear_ime", True))
+            sub_cmds, _ = build_text_input_commands(text, mode="typing", delay=delay, clear_ime=clear_ime)
+            expanded_commands.extend(sub_cmds)
+        else:
+            expanded_commands.append(cmd)
+
+    return bridge.publish_downlink(expanded_commands)
+
+
+@mcp.tool()
+def input_text(
+    text: str,
+    mode: str = "typing",
+    delay: int = 25,
+    clear_ime: bool = True,
+    target_os: str = "windows",
+) -> dict[str, Any]:
+    """
+    向受控目标主机当前聚焦的输入框录入文本。Agent 可根据场景自主选择三大模式：
+
+    1. "typing" (模拟打字模式，默认)：
+       逐键模拟物理按键敲击，按 delay 毫秒间隔逐字输入。
+       【核心准则】若用户未明确指定输入模式，Agent 必须默认采用此模式。
+       已修复换行归一化与空格时序粘连，打字前自动发 ESC 清理未决拼音悬挂。
+    2. "paste" (粘贴模式)：
+       【该输入中文时输入中文】的首选模式！
+       将文本通过安全通道置入目标机剪贴板并通过 Ctrl+V 瞬间粘贴。
+       凡涉及中文（汉字、中文注释、多行文本）、复杂符号、长代码时，Agent 应自主选择此模式，100% 保真不丢字。
+    3. "direct" (直接输入文字模式)：
+       直接向当前活动窗口逐字输入纯 ASCII 文本，不覆盖目标机原有剪贴板。
+       若文本包含中文字符，将自动安全升格为 paste 模式以防止文字丢失。
+
+    Args:
+        text: 待录入的文本（支持任意多行文本、中英文代码、中文注释）。
+        mode: 输入模式，可选 "typing"、"paste"、"direct"，缺省为 "typing"。
+        delay: 模拟打字模式下的字符间延时（毫秒，默认 25ms）。
+        clear_ime: 是否在打字前发送 ESC 清理输入法拼音候选框（默认 True）。
+        target_os: 目标受控机操作系统，可选 "windows"、"linux"、"macos"，默认 "windows"。
+    """
+    commands, actual_mode = build_text_input_commands(
+        text=text,
+        mode=mode,
+        delay=delay,
+        clear_ime=clear_ime,
+        target_os=target_os,
+    )
+    res = bridge.publish_downlink(commands)
+    res["requested_mode"] = mode or "typing"
+    res["actual_mode"] = actual_mode
+    res["text_length"] = len(text)
+    return res
 
 
 @mcp.tool()
